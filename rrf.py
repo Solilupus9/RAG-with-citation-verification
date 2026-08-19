@@ -27,7 +27,7 @@ def reciprocal_rank_fusion(
 
 def weighted_rrf(
 		ranked_lists: list[list[str]],
-		weights: list[float],
+		weights: tuple[float],
 		k: int = RRF_K
 ) -> list[tuple[str, float]]:
 	"""

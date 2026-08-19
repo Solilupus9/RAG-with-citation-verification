@@ -16,6 +16,7 @@ def hybrid_search_full(
 		dense_doc_ids: list,
 		corpus_lookup: dict,
 		candidates_k: int = 50,
+		rrf_weights: tuple = (0.20, 0.80),
 		final_k: int = 10,
 		use_reranker: bool = True
 ) -> list[dict]:
@@ -23,7 +24,7 @@ def hybrid_search_full(
 	Full hybrid retrieval pipeline:
 	1. BM25 sparse retrieval (top candidates_k)
 	2. Dense semantic retrieval (top candidates_k)
-	3. RRF fusion of both ranked lists
+	3. Weighed RRF fusion of both ranked lists
 	4. Optional cross-encoder re-ranking (top final_k)
 	"""
 	# Stage 1 & 2: Cast a wide net with both methods
@@ -32,12 +33,12 @@ def hybrid_search_full(
 	bm25_ids = [r["id"] for r in bm25_results]
 	dense_ids = [r["id"] for r in dense_results]
 	# Stage 3: Merge with RRF
-	fused_results = reciprocal_rank_fusion([bm25_ids, dense_ids])
+	fused_results = weighted_rrf([bm25_ids, dense_ids], rrf_weights)
 	fused_ids = [doc_id for doc_id, _ in fused_results]
 	if not use_reranker:
 		# Return RRF results directly
 		return [
-			{"id": doc_id, "score": score, "text": corpus_lookup.get(doc_id, "")[:300]}
+			{"id": doc_id, "score": score, "text": corpus_lookup.get(doc_id, "")}
 			for doc_id, score in fused_results[:final_k]
 		]
 	# Stage 4: Re-rank the fused candidates with a cross-encoder
