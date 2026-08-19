@@ -29,13 +29,17 @@ def generate_answer(
 Answer the question using only the provided documents.
 
 Rules:
-- Put a citation after every factual claim.
+- Use only the provided documents.
+- Write short, atomic factual claims.
+- Each sentence should contain only one main factual claim.
+- Put citations at the end of every factual sentence.
 - Use citations in the exact format [Document N].
-- N must refer to one of the provided documents.
-- Do not use outside knowledge.
-- If the documents do not contain enough information, say:
-  "The provided documents do not contain enough information to answer this."
+- For multiple sources, use [Document 1, Document 2].
+- N must refer to a provided document.
+- Do not combine unrelated claims into one sentence.
 - Do not invent figures, dates, names, or recommendations.
+- If the documents do not support an answer, say:
+  "The provided documents do not contain enough information to answer this."
 
 Question:
 {query}
