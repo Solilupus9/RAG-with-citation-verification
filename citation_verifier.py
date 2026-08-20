@@ -6,7 +6,8 @@ from sentence_transformers import CrossEncoder
 
 
 NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
-ENTAILMENT_THRESHOLD = 0.60
+ENTAILMENT_THRESHOLD = 0.75
+STRICT_ENTAILMENT_THRESHOLD = 0.90
 CONTRADICTION_THRESHOLD = 0.60
 
 nli_model: Optional[CrossEncoder] = None
@@ -52,27 +53,43 @@ def get_nli_model() -> CrossEncoder:
 
 def split_claims(text: str) -> list[str]:
     """
-    Split normal paragraphs and Markdown bullet items into claims.
+    Split answer text into granular factual claims.
+    Goal: one sentence-level claim per item, not mixed lists.
     """
     normalized = text.replace("\r\n", "\n").strip()
 
-    # Treat Markdown bullets as separate claim boundaries.
+    # Treat Markdown bullets as separate boundaries.
     normalized = re.sub(
         r"(?m)^\s*[*-]\s+",
         "\n",
         normalized,
     )
 
-    # Split after sentence punctuation, including before Markdown bullets.
-    parts = re.split(
-        r"(?<=[.!?])\s+|\n+",
-        normalized,
-    )
+    # Remove emphasis markup before splitting.
+    normalized = re.sub(r"[*_`]", "", normalized)
+
+    parts: list[str] = []
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+
+    for line in lines:
+        # First split into sentence units.
+        sentence_parts = re.split(r"(?<=[.!?])\s+", line)
+        for sentence in sentence_parts:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            # Then split semicolon-separated statements.
+            semicolon_parts = re.split(r"\s*;\s+", sentence)
+            for part in semicolon_parts:
+                cleaned = re.sub(r"\s+", " ", part).strip()
+                if cleaned:
+                    parts.append(cleaned)
 
     return [
-        re.sub(r"\s+", " ", part).strip()
+        part
         for part in parts
-        if part.strip()
+        if part
     ]
 
 
@@ -115,6 +132,7 @@ def remove_citations(claim: str) -> str:
 def classify_scores(
     scores,
     labels: list[str],
+    claim_text: str,
 ) -> dict:
     """
     Classify NLI softmax scores into a verdict based on the highest-scoring label.
@@ -137,6 +155,22 @@ def classify_scores(
         scores[label_to_index.get("neutral", 0)]
     )
 
+    lower_claim = claim_text.lower()
+    has_broad_or_absolute_language = bool(
+        re.search(
+            r"\b("
+            r"crucial|always|never|must|should|safe|safest|best|only|all|none|"
+            r"guaranteed|risk[- ]?free|no meaningful interest|avoid"
+            r")\b",
+            lower_claim,
+        )
+    )
+    support_threshold = (
+        STRICT_ENTAILMENT_THRESHOLD
+        if has_broad_or_absolute_language
+        else ENTAILMENT_THRESHOLD
+    )
+
     # Decide by the highest probability label. If tie or unexpected ordering
     # the fallback is UNSUPPORTED to avoid false positives.
     scores_map = {
@@ -147,9 +181,15 @@ def classify_scores(
 
     best_label = max(scores_map, key=scores_map.get)
 
-    if best_label == "entailment":
+    if (
+        best_label == "entailment"
+        and entailment_score >= support_threshold
+    ):
         verdict = "SUPPORTED"
-    elif best_label == "contradiction":
+    elif (
+        best_label == "contradiction"
+        and contradiction_score >= CONTRADICTION_THRESHOLD
+    ):
         verdict = "CONTRADICTED"
     else:
         verdict = "UNSUPPORTED"
@@ -159,6 +199,8 @@ def classify_scores(
         "entailment_score": entailment_score,
         "contradiction_score": contradiction_score,
         "neutral_score": neutral_score,
+        "support_threshold": support_threshold,
+        "strict_claim": has_broad_or_absolute_language,
     }
 
 
@@ -243,6 +285,7 @@ def verify_sentence(
     classification = classify_scores(
         scores[best_passage_idx],
         nli_labels,
+        claim_without_citation,
     )
 
     return {
@@ -286,6 +329,7 @@ def verify_answer(
                     "answer:",
                     "sources:",
                 }
+                or claim.endswith(":")
             )
         ):
             continue
