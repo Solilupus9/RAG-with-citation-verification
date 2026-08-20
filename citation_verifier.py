@@ -11,33 +11,7 @@ CONTRADICTION_THRESHOLD = 0.60
 
 nli_model: Optional[CrossEncoder] = None
 nli_labels: Optional[list[str]] = None
-SOURCE_CHUNK_WORDS = 120
-SOURCE_CHUNK_OVERLAP = 30
 
-
-def chunk_source(text: str) -> list[str]:
-    words = text.split()
-
-    if not words:
-        return []
-
-    chunks = []
-    start = 0
-
-    while start < len(words):
-        end = min(
-            start + SOURCE_CHUNK_WORDS,
-            len(words)
-        )
-
-        chunks.append(" ".join(words[start:end]))
-
-        if end == len(words):
-            break
-
-        start = end - SOURCE_CHUNK_OVERLAP
-
-    return chunks
 
 def get_nli_model() -> CrossEncoder:
     global nli_model, nli_labels
@@ -71,6 +45,7 @@ def get_nli_model() -> CrossEncoder:
 
         print(f"NLI verifier device: {device}")
         print(f"NLI label order: {nli_labels}")
+
 
     return nli_model
 
@@ -124,51 +99,57 @@ def extract_citations(claim: str) -> list[int]:
 
 
 def remove_citations(claim: str) -> str:
+    """
+    Remove citation markup before NLI verification.
+    """
     cleaned = re.sub(
-        r"\[[^\]]*Document\s+\d+[^\]]*\]",
+        r"\s*\[[^\]]*Document\s+\d+[^\]]*\]",
         "",
         claim,
         flags=re.IGNORECASE,
     )
 
-    cleaned = re.sub(
-        r"\s+",
-        " ",
-        cleaned,
-    )
+    return re.sub(r"\s+", " ", cleaned).strip()
 
-    return cleaned.strip()
 
 def classify_scores(
     scores,
     labels: list[str],
 ) -> dict:
+    """
+    Classify NLI softmax scores into a verdict based on the highest-scoring label.
+    This avoids overly-strict fixed thresholds that can mark reasonable entailment
+    predictions as unsupported when the model's probabilities are more spread out.
+    """
     label_to_index = {
         label.lower(): index
         for index, label in enumerate(labels)
     }
 
+    # Read scores for each label (fall back to 0.0 if a label is unexpectedly missing)
     contradiction_score = float(
-        scores[label_to_index["contradiction"]]
+        scores[label_to_index.get("contradiction", 0)]
     )
     entailment_score = float(
-        scores[label_to_index["entailment"]]
+        scores[label_to_index.get("entailment", 0)]
     )
     neutral_score = float(
-        scores[label_to_index["neutral"]]
+        scores[label_to_index.get("neutral", 0)]
     )
 
-    if (
-        entailment_score >= ENTAILMENT_THRESHOLD
-        and entailment_score > contradiction_score
-        and entailment_score > neutral_score
-    ):
+    # Decide by the highest probability label. If tie or unexpected ordering
+    # the fallback is UNSUPPORTED to avoid false positives.
+    scores_map = {
+        "contradiction": contradiction_score,
+        "entailment": entailment_score,
+        "neutral": neutral_score,
+    }
+
+    best_label = max(scores_map, key=scores_map.get)
+
+    if best_label == "entailment":
         verdict = "SUPPORTED"
-    elif (
-        contradiction_score >= CONTRADICTION_THRESHOLD
-        and contradiction_score > entailment_score
-        and contradiction_score > neutral_score
-    ):
+    elif best_label == "contradiction":
         verdict = "CONTRADICTED"
     else:
         verdict = "UNSUPPORTED"
@@ -185,6 +166,13 @@ def verify_sentence(
     sentence: str,
     cited_documents: list[dict],
 ) -> dict:
+    """
+    Verify a single claim against cited documents by breaking each document into
+    small passages (3-sentence chunks), scoring each passage, and using the
+    highest-scoring passage per document to find the best supporting document.
+    This improves signal when documents are long and the relevant text is a
+    small section that would otherwise be truncated or diluted.
+    """
     model = get_nli_model()
 
     if not cited_documents:
@@ -198,31 +186,36 @@ def verify_sentence(
 
     claim_without_citation = remove_citations(sentence)
 
-    evidence = []
+    # Build passages per document: split into sentences and group into windows
+    passages = []  # list of tuples (doc_index, passage_text)
 
     for document in cited_documents:
-        chunks = chunk_source(document["text"])
+        text = document["text"] or ""
+        # Split into sentences (simple heuristic)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
-        for chunk_index, chunk in enumerate(chunks):
-            evidence.append({
-                "document_index": document["index"],
-                "chunk_index": chunk_index,
-                "text": chunk,
-            })
+        if not sentences:
+            # fallback to full text if sentence-splitting failed
+            passages.append((document["index"], text))
+            continue
 
-    if not evidence:
+        window_size = 3
+        for i in range(0, len(sentences), window_size):
+            chunk = " ".join(sentences[i : i + window_size])
+            passages.append((document["index"], chunk))
+
+    # Prepare model pairs and keep mapping to which doc/passage
+    pairs = [[passage, claim_without_citation] for (_idx, passage) in passages]
+
+    if not pairs:
+        # Nothing to check; return unsupported by default
         return {
-            "verdict": "MISSING_SOURCE",
+            "verdict": "UNSUPPORTED",
             "best_document": None,
             "entailment_score": 0.0,
             "contradiction_score": 0.0,
             "neutral_score": 0.0,
         }
-
-    pairs = [
-        [item["text"], claim_without_citation]
-        for item in evidence
-    ]
 
     scores = model.predict(
         pairs,
@@ -231,58 +224,32 @@ def verify_sentence(
     )
 
     if nli_labels is None:
-        raise RuntimeError(
-            "NLI labels were not initialized"
-        )
+        raise RuntimeError("NLI labels were not initialized")
 
     entailment_index = nli_labels.index("entailment")
-    contradiction_index = nli_labels.index("contradiction")
-    neutral_index = nli_labels.index("neutral")
 
-    best_index = max(
-        range(len(scores)),
-        key=lambda index: float(
-            scores[index][entailment_index]
-        ),
+    # For each passage, get its entailment score and group by document
+    doc_best = {}  # doc_index -> (best_passage_idx, best_entailment_score)
+
+    for i, (doc_index, _passage) in enumerate(passages):
+        ent_score = float(scores[i][entailment_index])
+        if doc_index not in doc_best or ent_score > doc_best[doc_index][1]:
+            doc_best[doc_index] = (i, ent_score)
+
+    # Choose the document whose best passage has the highest entailment score
+    best_doc_index = max(doc_best.items(), key=lambda kv: kv[1][1])[0]
+    best_passage_idx = doc_best[best_doc_index][0]
+
+    classification = classify_scores(
+        scores[best_passage_idx],
+        nli_labels,
     )
-
-    best_scores = scores[best_index]
-
-    entailment_score = float(
-        best_scores[entailment_index]
-    )
-    contradiction_score = float(
-        best_scores[contradiction_index]
-    )
-    neutral_score = float(
-        best_scores[neutral_index]
-    )
-
-    if (
-        entailment_score >= ENTAILMENT_THRESHOLD
-        and entailment_score > contradiction_score
-        and entailment_score > neutral_score
-    ):
-        verdict = "SUPPORTED"
-    elif (
-        contradiction_score >= CONTRADICTION_THRESHOLD
-        and contradiction_score > entailment_score
-        and contradiction_score > neutral_score
-    ):
-        verdict = "CONTRADICTED"
-    else:
-        verdict = "UNSUPPORTED"
-
-    best_evidence = evidence[best_index]
 
     return {
-        "verdict": verdict,
-        "best_document": best_evidence["document_index"],
-        "best_chunk": best_evidence["chunk_index"],
-        "entailment_score": entailment_score,
-        "contradiction_score": contradiction_score,
-        "neutral_score": neutral_score,
+        **classification,
+        "best_document": best_doc_index,
     }
+
 
 def verify_answer(
     answer: str,

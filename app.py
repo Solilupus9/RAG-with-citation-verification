@@ -88,16 +88,6 @@ def main():
                 f"neutral={claim['neutral_score']:.3f}"
             )
 
-        if "best_document" in claim:
-            print(
-                "  best document:",
-                claim["best_document"],
-                "chunk:",
-                claim.get("best_chunk"),
-            )
-
-        
-
     if faithfulness is not None and faithfulness < 0.80:
         print(
             "\nWARNING: Some claims were not sufficiently supported "

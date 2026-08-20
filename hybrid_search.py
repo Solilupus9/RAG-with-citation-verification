@@ -38,11 +38,7 @@ def hybrid_search_full(
 	if not use_reranker:
 		# Return RRF results directly
 		return [
-			{
-				"id": doc_id,
-				"score": score,
-				"text": corpus_lookup.get(doc_id, "")
-			}
+			{"id": doc_id, "score": score, "text": corpus_lookup.get(doc_id, "")}
 			for doc_id, score in fused_results[:final_k]
 		]
 	# Stage 4: Re-rank the fused candidates with a cross-encoder
