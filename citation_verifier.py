@@ -4,7 +4,6 @@ from typing import Optional
 import torch
 from sentence_transformers import CrossEncoder
 
-
 NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
 ENTAILMENT_THRESHOLD = 0.75
 STRICT_ENTAILMENT_THRESHOLD = 0.90
@@ -12,6 +11,14 @@ CONTRADICTION_THRESHOLD = 0.60
 
 nli_model: Optional[CrossEncoder] = None
 nli_labels: Optional[list[str]] = None
+
+ABBR_PATTERN = (
+    r"\b(?:"
+    r"e\.g\.|i\.e\.|u\.s\.|u\.k\.|dr\.|mr\.|mrs\.|ms\.|prof\.|"
+    r"inc\.|corp\.|ltd\.|co\.|vs\.|etc\.|fig\.|no\.|vol\.|approx\.|"
+    r"jan\.|feb\.|mar\.|apr\.|jun\.|jul\.|aug\.|sep\.|sept\.|oct\.|nov\.|dec\."
+    r")"
+)
 
 
 def get_nli_model() -> CrossEncoder:
@@ -47,8 +54,41 @@ def get_nli_model() -> CrossEncoder:
         print(f"NLI verifier device: {device}")
         print(f"NLI label order: {nli_labels}")
 
-
     return nli_model
+
+
+def split_sentences_robust(text: str) -> list[str]:
+    """
+    Split text into sentences while avoiding false splits on abbreviations
+    (e.g., U.S., e.g., i.e., vs., Dec.), decimal numbers (e.g., 4.5%, $10.50),
+    and bracketed citations.
+    """
+    if not text or not text.strip():
+        return []
+
+    temp_text = text.strip()
+    placeholder = "___DOT___"
+
+    # Protect decimal numbers (digits.digits)
+    temp_text = re.sub(r"(\d+)\.(\d+)", rf"\1{placeholder}\2", temp_text)
+
+    # Protect known abbreviations and months case-insensitively
+    def _replace_abbr(match: re.Match) -> str:
+        return match.group(0).replace(".", placeholder)
+
+    temp_text = re.sub(ABBR_PATTERN, _replace_abbr, temp_text, flags=re.IGNORECASE)
+
+    # Split on sentence terminals followed by whitespace and beginning of sentence
+    splits = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'\[])", temp_text)
+
+    results = []
+    for s in splits:
+        restored = s.replace(placeholder, ".")
+        cleaned = re.sub(r"\s+", " ", restored).strip()
+        if cleaned:
+            results.append(cleaned)
+
+    return results if results else [text.strip()]
 
 
 def split_claims(text: str) -> list[str]:
@@ -58,39 +98,30 @@ def split_claims(text: str) -> list[str]:
     """
     normalized = text.replace("\r\n", "\n").strip()
 
-    # Treat Markdown bullets as separate boundaries.
+    # Treat Markdown bullets as separate boundaries
     normalized = re.sub(
         r"(?m)^\s*[*-]\s+",
         "\n",
         normalized,
     )
 
-    # Remove emphasis markup before splitting.
+    # Remove emphasis markup before splitting
     normalized = re.sub(r"[*_`]", "", normalized)
 
     parts: list[str] = []
     lines = [line.strip() for line in normalized.split("\n") if line.strip()]
 
     for line in lines:
-        # First split into sentence units.
-        sentence_parts = re.split(r"(?<=[.!?])\s+", line)
+        sentence_parts = split_sentences_robust(line)
         for sentence in sentence_parts:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-
-            # Then split semicolon-separated statements.
+            # Also split on semicolon-separated independent statements
             semicolon_parts = re.split(r"\s*;\s+", sentence)
             for part in semicolon_parts:
                 cleaned = re.sub(r"\s+", " ", part).strip()
                 if cleaned:
                     parts.append(cleaned)
 
-    return [
-        part
-        for part in parts
-        if part
-    ]
+    return parts
 
 
 def extract_citations(claim: str) -> list[int]:
@@ -101,7 +132,6 @@ def extract_citations(claim: str) -> list[int]:
       [Document 1, Document 2, Document 3]
     """
     citations = []
-
     pattern = r"\[([^\]]+)\]"
 
     for bracket_content in re.findall(pattern, claim):
@@ -125,7 +155,6 @@ def remove_citations(claim: str) -> str:
         claim,
         flags=re.IGNORECASE,
     )
-
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
@@ -135,16 +164,14 @@ def classify_scores(
     claim_text: str,
 ) -> dict:
     """
-    Classify NLI softmax scores into a verdict based on the highest-scoring label.
-    This avoids overly-strict fixed thresholds that can mark reasonable entailment
-    predictions as unsupported when the model's probabilities are more spread out.
+    Classify NLI softmax scores into a verdict based on the highest-scoring label
+    and calibrated probability thresholds.
     """
     label_to_index = {
         label.lower(): index
         for index, label in enumerate(labels)
     }
 
-    # Read scores for each label (fall back to 0.0 if a label is unexpectedly missing)
     contradiction_score = float(
         scores[label_to_index.get("contradiction", 0)]
     )
@@ -171,8 +198,6 @@ def classify_scores(
         else ENTAILMENT_THRESHOLD
     )
 
-    # Decide by the highest probability label. If tie or unexpected ordering
-    # the fallback is UNSUPPORTED to avoid false positives.
     scores_map = {
         "contradiction": contradiction_score,
         "entailment": entailment_score,
@@ -210,10 +235,8 @@ def verify_sentence(
 ) -> dict:
     """
     Verify a single claim against cited documents by breaking each document into
-    small passages (3-sentence chunks), scoring each passage, and using the
-    highest-scoring passage per document to find the best supporting document.
-    This improves signal when documents are long and the relevant text is a
-    small section that would otherwise be truncated or diluted.
+    overlapping sliding-window passages (3-sentence windows with stride 2),
+    scoring each passage with NLI CrossEncoder, and finding the best supporting passage.
     """
     model = get_nli_model()
 
@@ -228,29 +251,31 @@ def verify_sentence(
 
     claim_without_citation = remove_citations(sentence)
 
-    # Build passages per document: split into sentences and group into windows
+    # Build overlapping passages per document
     passages = []  # list of tuples (doc_index, passage_text)
+    window_size = 3
+    stride = 2
 
     for document in cited_documents:
-        text = document["text"] or ""
-        # Split into sentences (simple heuristic)
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        text = document.get("text", "") or ""
+        sentences = split_sentences_robust(text)
 
         if not sentences:
-            # fallback to full text if sentence-splitting failed
             passages.append((document["index"], text))
             continue
 
-        window_size = 3
-        for i in range(0, len(sentences), window_size):
-            chunk = " ".join(sentences[i : i + window_size])
-            passages.append((document["index"], chunk))
+        if len(sentences) <= window_size:
+            passages.append((document["index"], " ".join(sentences)))
+        else:
+            for i in range(0, len(sentences), stride):
+                chunk = " ".join(sentences[i : i + window_size])
+                passages.append((document["index"], chunk))
+                if i + window_size >= len(sentences):
+                    break
 
-    # Prepare model pairs and keep mapping to which doc/passage
     pairs = [[passage, claim_without_citation] for (_idx, passage) in passages]
 
     if not pairs:
-        # Nothing to check; return unsupported by default
         return {
             "verdict": "UNSUPPORTED",
             "best_document": None,
@@ -270,7 +295,7 @@ def verify_sentence(
 
     entailment_index = nli_labels.index("entailment")
 
-    # For each passage, get its entailment score and group by document
+    # Group best passage per document
     doc_best = {}  # doc_index -> (best_passage_idx, best_entailment_score)
 
     for i, (doc_index, _passage) in enumerate(passages):
@@ -320,7 +345,7 @@ def verify_answer(
     for claim in split_claims(answer):
         citation_numbers = extract_citations(claim)
 
-        # Ignore headings and generic intro lines.
+        # Ignore headings and generic intro lines
         if (
             not citation_numbers
             and (

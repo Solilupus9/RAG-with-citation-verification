@@ -63,3 +63,61 @@ Answer:
 		"answer": response["response"],
 		"documents": retrieved_docs,
 	}
+
+
+def self_correct_answer(
+		query: str,
+		initial_answer: str,
+		unverified_claims: list[dict],
+		retrieved_docs: list[dict],
+) -> dict[str, Any]:
+	"""
+	Re-prompt the LLM to resolve or eliminate unverified/contradicted claims
+	using only the cited source documents.
+	"""
+	context = build_context(retrieved_docs)
+	feedback_lines = []
+	for c in unverified_claims:
+		verdict = c.get("verdict", "UNSUPPORTED")
+		sentence = c.get("sentence", "")
+		citations = c.get("citations", [])
+		citations_str = ", ".join(f"Document {n}" for n in citations) if citations else "No Citation"
+		feedback_lines.append(f"- [{verdict}] \"{sentence}\" (Cited: {citations_str})")
+
+	feedback_text = "\n".join(feedback_lines)
+
+	prompt = f"""You are a precise, self-correcting factual assistant.
+
+A previous answer was checked against the provided documents and had the following verification issues:
+{feedback_text}
+
+Original Answer:
+{initial_answer}
+
+Original Question:
+{query}
+
+Documents:
+{context}
+
+Correction Instructions:
+1. Rewrite the answer so that EVERY single claim is 100% supported by the cited documents.
+2. Completely remove any claim that cannot be verified or is contradicted by the documents.
+3. Fix any invalid or missing citation numbers (e.g. [Document N]).
+4. Maintain strict factual accuracy with one claim per sentence.
+
+Corrected Answer:
+"""
+
+	response = ollama.generate(
+		model=LLM_MODEL,
+		prompt=prompt,
+		options={
+			"temperature": 0,
+		}
+	)
+
+	return {
+		"answer": response["response"],
+		"documents": retrieved_docs,
+	}

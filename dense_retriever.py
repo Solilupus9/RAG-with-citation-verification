@@ -9,8 +9,10 @@ from sentence_transformers import SentenceTransformer
 DATA_DIR = "./data"
 EMBED_DIR = "./indexes/dense"
 os.makedirs(EMBED_DIR, exist_ok=True)
-# dense_retriever.py
+
+# BGE model configuration
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 EMBEDDING_DIM = 384
 BATCH_SIZE = 256
 model: Optional[SentenceTransformer] = None
@@ -23,11 +25,11 @@ def get_embedding_model() -> SentenceTransformer | None:
 	return model
 
 
-
 def create_embeddings(texts: list[object]) -> np.ndarray:
 	"""
-	Create embeddings for a list of texts in batches.
+	Create embeddings for a list of corpus document texts in batches.
 	Returns a numpy array of shape (n_texts, EMBEDDING_DIM).
+	Note: Do NOT prepend query instruction to document texts.
 	"""
 	if not texts:
 		return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
@@ -52,7 +54,6 @@ def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
 	"""
 	L2-normalize vectors so each has unit length.
 	After normalization: cosine_similarity(a, b) == dot_product(a, b)
-	This is crucial — it's what makes our matrix multiplication valid.
 	"""
 	norms = np.linalg.norm(vectors, axis=1, keepdims=True)
 	# Avoid division by zero for zero vectors
@@ -64,7 +65,7 @@ def build_dense_index():
 	"""Build and persist the dense embedding index from the corpus."""
 	corpus = pq.read_table(f"{DATA_DIR}/corpus.parquet")
 	doc_ids = [str(doc_id) for doc_id in corpus.column("_id").to_pylist()]
-	doc_texts = [str(text) for text in corpus.column("text").to_pylist()]  # pyright: ignore[reportGeneralTypeIssues]
+	doc_texts = [str(text) for text in corpus.column("text").to_pylist()]
 	print(f"Creating embeddings for {len(doc_texts):,} documents...")
 	embeddings = create_embeddings(doc_texts)
 	# Normalize for efficient cosine similarity via dot product
@@ -91,27 +92,34 @@ def dense_search(
 		k: int = 10
 ) -> list[dict]:
 	"""
-	Search the dense index using cosine similarity.
-	Because embeddings are normalized, this is just a dot product.
+	Search the dense index using cosine similarity with BGE query instruction.
+	Uses fast top-k partitioning (np.argpartition) for O(N) selection.
 	"""
+	# Prepend instruction for BGE queries
+	query_with_instruction = f"{QUERY_INSTRUCTION}{query}"
+
 	# Embed the query
 	embedding_model = get_embedding_model()
 	query_vector = embedding_model.encode(
-		[query],
+		[query_with_instruction],
 		convert_to_numpy=True,
 		normalize_embeddings=True,
 		show_progress_bar=False
 	)[0].astype(np.float32)
-	# Normalize query vector too
+
+	# Normalize query vector
 	query_vector = normalize_vectors(query_vector.reshape(1, -1)).flatten()
+
 	# Compute cosine similarity for all documents at once
-	# embeddings shape: (n_docs, EMBEDDING_DIM)
-	# query_vector shape: (EMBEDDING_DIM,)
-	# Result: (n_docs,) — one score per document
-	# This is a single matrix-vector multiplication — extremely fast with numpy
 	scores = embeddings @ query_vector
-	# Get indices of top-k scores (argsort returns ascending, so we reverse)
-	top_k_indices = np.argsort(scores)[::-1][:k]
+
+	# Fast O(N) top-k selection using np.argpartition
+	if k >= len(scores):
+		top_k_indices = np.argsort(scores)[::-1]
+	else:
+		top_partition = np.argpartition(scores, -k)[-k:]
+		top_k_indices = top_partition[np.argsort(scores[top_partition])[::-1]]
+
 	return [
 		{"id": doc_ids[idx], "score": float(scores[idx]), "rank": rank + 1}
 		for rank, idx in enumerate(top_k_indices)
