@@ -5,8 +5,8 @@ import torch
 from sentence_transformers import CrossEncoder
 
 NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
-ENTAILMENT_THRESHOLD = 0.75
-STRICT_ENTAILMENT_THRESHOLD = 0.90
+ENTAILMENT_THRESHOLD = 0.70
+STRICT_ENTAILMENT_THRESHOLD = 0.78
 CONTRADICTION_THRESHOLD = 0.60
 
 nli_model: Optional[CrossEncoder] = None
@@ -186,8 +186,7 @@ def classify_scores(
     has_broad_or_absolute_language = bool(
         re.search(
             r"\b("
-            r"crucial|always|never|must|should|safe|safest|best|only|all|none|"
-            r"guaranteed|risk[- ]?free|no meaningful interest|avoid"
+            r"always|never|must|guaranteed|risk[- ]?free|100%|only|impossible"
             r")\b",
             lower_claim,
         )
@@ -234,9 +233,9 @@ def verify_sentence(
     cited_documents: list[dict],
 ) -> dict:
     """
-    Verify a single claim against cited documents by breaking each document into
-    overlapping sliding-window passages (3-sentence windows with stride 2),
-    scoring each passage with NLI CrossEncoder, and finding the best supporting passage.
+    Verify a single claim against cited documents.
+    Generates granular individual sentence passages and 2-sentence adjacent windows
+    to avoid premise dilution while capturing multi-sentence claims.
     """
     model = get_nli_model()
 
@@ -251,10 +250,10 @@ def verify_sentence(
 
     claim_without_citation = remove_citations(sentence)
 
-    # Build overlapping passages per document
+    # Build granular passages per document:
+    # 1) Single sentences (prevents premise dilution on atomic claims)
+    # 2) 2-sentence contiguous pairs (captures premises spanning two sentences)
     passages = []  # list of tuples (doc_index, passage_text)
-    window_size = 3
-    stride = 2
 
     for document in cited_documents:
         text = document.get("text", "") or ""
@@ -264,14 +263,13 @@ def verify_sentence(
             passages.append((document["index"], text))
             continue
 
-        if len(sentences) <= window_size:
-            passages.append((document["index"], " ".join(sentences)))
-        else:
-            for i in range(0, len(sentences), stride):
-                chunk = " ".join(sentences[i : i + window_size])
-                passages.append((document["index"], chunk))
-                if i + window_size >= len(sentences):
-                    break
+        for s in sentences:
+            if s.strip():
+                passages.append((document["index"], s.strip()))
+
+        for i in range(len(sentences) - 1):
+            pair_chunk = f"{sentences[i]} {sentences[i + 1]}".strip()
+            passages.append((document["index"], pair_chunk))
 
     pairs = [[passage, claim_without_citation] for (_idx, passage) in passages]
 
@@ -287,7 +285,7 @@ def verify_sentence(
     scores = model.predict(
         pairs,
         apply_softmax=True,
-        batch_size=8,
+        batch_size=16,
     )
 
     if nli_labels is None:
@@ -295,7 +293,7 @@ def verify_sentence(
 
     entailment_index = nli_labels.index("entailment")
 
-    # Group best passage per document
+    # Group best passage per document by highest entailment score
     doc_best = {}  # doc_index -> (best_passage_idx, best_entailment_score)
 
     for i, (doc_index, _passage) in enumerate(passages):

@@ -72,11 +72,17 @@ def main():
         use_reranker=True,
     )
 
-    print("Generating initial answer...")
+    print("\n" + "=" * 50)
+    print("INITIAL ANSWER (Streaming)")
+    print("=" * 50)
     result = generate_answer(
         query=query,
         retrieved_docs=retrieved_docs,
+        prune_context=True,
+        stream=True,
+        on_token=lambda tok: print(tok, end="", flush=True),
     )
+    print()
 
     answer = result["answer"]
     documents = result["documents"]
@@ -90,11 +96,6 @@ def main():
         answer=answer,
         retrieved_docs=documents,
     )
-
-    print("\n" + "=" * 50)
-    print("INITIAL ANSWER")
-    print("=" * 50)
-    print(answer)
 
     print("\n" + "-" * 50)
     print("INITIAL CITATION VERIFICATION")
@@ -112,7 +113,7 @@ def main():
     # Trigger self-correction loop if needed
     if unverified_claims or (faithfulness is not None and faithfulness < 0.80):
         print("\n" + "=" * 50)
-        print("TRIGGERING SELF-CORRECTION LOOP (Self-Reflective RAG)...")
+        print("TRIGGERING SELF-CORRECTION LOOP (Streaming Corrected Answer)...")
         print("=" * 50)
 
         corrected_result = self_correct_answer(
@@ -120,7 +121,11 @@ def main():
             initial_answer=answer,
             unverified_claims=unverified_claims,
             retrieved_docs=documents,
+            prune_context=True,
+            stream=True,
+            on_token=lambda tok: print(tok, end="", flush=True),
         )
+        print()
 
         corrected_answer = corrected_result["answer"]
         corrected_citation_status = validate_citation_numbers(
@@ -132,10 +137,9 @@ def main():
             retrieved_docs=documents,
         )
 
-        print("\nCORRECTED ANSWER\n")
-        print(corrected_answer)
-
-        print("\nCORRECTED CITATION VERIFICATION\n")
+        print("\n" + "-" * 50)
+        print("CORRECTED CITATION VERIFICATION")
+        print("-" * 50)
         print_verification_report(corrected_verification, corrected_citation_status)
 
         # Update output variables
