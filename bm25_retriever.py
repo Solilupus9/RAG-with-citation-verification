@@ -2,19 +2,11 @@ import os
 
 import bm25s
 import pandas as pd
+from Stemmer import Stemmer
 
 DATA_DIR = "./data"
 INDEX_DIR = "./indexes/bm25"
 os.makedirs(INDEX_DIR, exist_ok=True)
-
-
-def get_stemmer():
-	"""Get optional English stemmer if PyStemmer is installed."""
-	try:
-		import Stemmer
-		return Stemmer.Stemmer("english")
-	except ImportError:
-		return None
 
 
 def build_bm25_index():
@@ -28,7 +20,7 @@ def build_bm25_index():
 	corpus_records = [{"id": doc_id, "text": doc_text} for doc_id, doc_text in zip(doc_ids, doc_texts)]
 	print(f"Tokenizing {len(doc_texts):,} documents...")
 
-	stemmer = get_stemmer()
+	stemmer = Stemmer("english")
 	if stemmer:
 		print("Applying PyStemmer English stemming...")
 
@@ -62,7 +54,8 @@ def bm25_search(query: str, retriever, k: int = 10) -> list[dict]:
 	Search the BM25 index for a given query.
 	Returns top-k results as a list of dicts with id, score, text.
 	"""
-	stemmer = get_stemmer()
+
+	stemmer = Stemmer("english")
 	query_tokens = bm25s.tokenize(query, stopwords="en", stemmer=stemmer)
 
 	results, scores = retriever.retrieve(query_tokens, k=k)
