@@ -6,7 +6,7 @@ RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L12-v2"
 rerank_model: Optional[CrossEncoder] = None
 
 
-def get_rerank_model() -> CrossEncoder | None:
+def get_rerank_model() -> CrossEncoder:
 	global rerank_model
 	if rerank_model is None:
 		rerank_model = CrossEncoder(RERANK_MODEL)
